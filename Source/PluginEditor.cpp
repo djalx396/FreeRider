@@ -424,9 +424,9 @@ void RiderEditor::paint (Graphics& g)
 {
     g.fillAll (ui::bg);
     g.setFont (uiFont (20.f, true)); g.setColour (ui::text);
-    g.drawText ("RIDER", 22, 10, 120, 28, Justification::centredLeft);
+    g.drawText ("FREE RIDER", 22, 10, 160, 28, Justification::centredLeft);
     g.setFont (uiFont (11.f)); g.setColour (ui::dim);
-    g.drawText ("automatic vocal gain rider   |   v0.1", 104, 14, 300, 22, Justification::centredLeft);
+    g.drawText ("automatic vocal gain rider   |   v0.1", 168, 14, 300, 22, Justification::centredLeft);
     g.drawText (proc.getTotalNumInputChannels() > 2 ? "music sidechain: track ch 3/4" : "no sidechain bus",
                 520, 14, 240, 22, Justification::centredRight);
 

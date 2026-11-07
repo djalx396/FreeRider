@@ -1,19 +1,19 @@
-# Rider v0.1 — automatic vocal gain rider
+# Free Rider v0.1 — automatic vocal gain rider
 
 A clone of Waves Vocal Rider's behaviour: JUCE, VST3 + AU, native on Apple Silicon
 (universal binary), **zero latency**, mono or stereo in one plugin, music sidechain.
 
 ## Build (GitHub, same as the other plugins)
 
-1. Create a new GitHub repo (e.g. `rider`) and push this folder to it.
-2. The **Build Rider** workflow runs on every push (Actions tab). It fetches JUCE
+1. Create a new GitHub repo (e.g. `free-rider`) and push this folder to it.
+2. The **Build Free Rider** workflow runs on every push (Actions tab). It fetches JUCE
    8.0.4 itself and builds a universal VST3 + AU.
-3. Download the **Rider-macOS** artifact from the finished run and unzip it.
-4. Copy `Rider.vst3` → `~/Library/Audio/Plug-Ins/VST3/` and `Rider.component` →
+3. Download the **FreeRider-macOS** artifact from the finished run and unzip it.
+4. Copy `Free Rider.vst3` → `~/Library/Audio/Plug-Ins/VST3/` and `Free Rider.component` →
    `~/Library/Audio/Plug-Ins/Components/`.
 5. Clear the download quarantine, then rescan in Reaper:
    ```bash
-   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/Rider.vst3 ~/Library/Audio/Plug-Ins/Components/Rider.component
+   xattr -dr com.apple.quarantine "$HOME/Library/Audio/Plug-Ins/VST3/Free Rider.vst3" "$HOME/Library/Audio/Plug-Ins/Components/Free Rider.component"
    ```
 
 Local build instead: `cmake -B build -G Xcode && cmake --build build --config Release`.

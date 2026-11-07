@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Rider VERSION 0.1.0)
+project(FreeRider VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,13 +22,13 @@ if(APPLE)
     list(APPEND RIDER_FORMATS AU)
 endif()
 
-juce_add_plugin(Rider
+juce_add_plugin(FreeRider
     COMPANY_NAME "Chris"
-    BUNDLE_ID "com.chris.rider"
+    BUNDLE_ID "com.chris.freerider"
     PLUGIN_MANUFACTURER_CODE Chrs
-    PLUGIN_CODE Rdr1
+    PLUGIN_CODE FRdr
     FORMATS ${RIDER_FORMATS}
-    PRODUCT_NAME "Rider"
+    PRODUCT_NAME "Free Rider"
     DESCRIPTION "Automatic vocal gain rider"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
@@ -39,16 +39,16 @@ juce_add_plugin(Rider
     AU_MAIN_TYPE kAudioUnitType_Effect
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
-target_sources(Rider PRIVATE
+target_sources(FreeRider PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp)
 
-target_compile_definitions(Rider PUBLIC
+target_compile_definitions(FreeRider PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
-target_link_libraries(Rider
+target_link_libraries(FreeRider
     PRIVATE juce::juce_audio_utils juce::juce_audio_processors
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
