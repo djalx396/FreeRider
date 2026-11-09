@@ -98,6 +98,8 @@ struct Telemetry
     std::atomic<float> musicLed  { 0.f };     // 0…1 brightness
     std::atomic<float> targetEff { -21.f };   // Target after music offset
     std::atomic<bool>  riding    { false };
+    std::atomic<float> duckGrDb  { 0.f };     // ducker gain reduction (positive dB)
+    std::atomic<float> keyDb     { -100.f };  // duck key level
 };
 
 class Engine
@@ -287,6 +289,86 @@ private:
     double msG = 0, msR = 0, mms = 0, level = -100, gateLevel = -100, wordPk = -100, musicDb = -100;
     bool active = false, holding = false; int holdLeft = 0, onsetLeft = 0;
     double autoDb = 0, appliedDb = 0, rangeLo = -100, rangeHi = -100;
+};
+
+//==============================================================================
+// Ducker: sits right after the rider. Listens to a key (an Ecosystem channel) and
+// pulls the vocal down while the key is above the threshold, by up to Depth dB.
+// Its key detector is the rider's own (same weighting, same 10 ms gate RMS, same
+// peak-style follower), and it follows the rider's Attack switch, so Fast/Slow
+// set the duck speed exactly as they set the riding speed:
+//   Slow: 30 ms down / 300 ms back up      Fast: 8 ms down / 150 ms back up
+//   reduction = clamp(keyLevel − Threshold, 0, Depth)   (1 dB of duck per dB over)
+struct DuckSettings
+{
+    bool   on        = false;   // a channel is selected
+    double depthDb   = 6.0;     // 0 … 24
+    double threshDb  = -30.0;   // -60 … 0 dBFS
+    AttackMode attack = AttackMode::Slow;
+};
+
+class Ducker
+{
+public:
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        for (auto& w : keyW) w.prepare (fs);
+        gateCoef = coef (Engine::kGateTau);
+        setAttack (AttackMode::Slow);
+        reset();
+    }
+    void reset() { for (auto& w : keyW) w.reset(); msG = msR = 0; grDb = 0; keyDb = -100; }
+
+    // keyL/keyR may be null (no key: the duck lets go at the release speed).
+    void process (float* const* io, int numCh, const float* keyL, const float* keyR, int n,
+                  const DuckSettings& d, Telemetry* t)
+    {
+        if (d.attack != curAttack) setAttack (d.attack);
+        const bool haveKey = d.on && keyL != nullptr;
+        const double depth = d.on ? std::clamp (d.depthDb, 0.0, 24.0) : 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            double p = 0;
+            if (haveKey)
+            {
+                const double a = keyW[0].process (keyL[i]);
+                const double b = keyW[1].process (keyR != nullptr ? keyR[i] : keyL[i]);
+                p = 0.5 * (a * a + b * b);
+            }
+            msG += gateCoef * (p - msG);
+            msR += (msG > msR ? attCoef : relCoef) * (msG - msR);
+            keyDb = 10.0 * std::log10 (msR + 1e-20) + Engine::kCalDb;
+            grDb = std::clamp (keyDb - d.threshDb, 0.0, depth);
+            if (grDb > 1e-4)
+            {
+                const float g = (float) std::exp (-grDb * 0.11512925464970229);
+                for (int c = 0; c < numCh; ++c) io[c][i] *= g;
+            }
+        }
+        if (t != nullptr)
+        {
+            t->duckGrDb.store ((float) grDb);
+            t->keyDb.store ((float) keyDb);
+        }
+    }
+
+    double getGrDb() const noexcept { return grDb; }
+
+private:
+    double coef (double tau) const { return 1.0 - std::exp (-1.0 / (tau * fs)); }
+    void setAttack (AttackMode a)
+    {
+        curAttack = a;
+        const auto& T = (a == AttackMode::Fast) ? Engine::kFast : Engine::kSlow;
+        attCoef = coef (T.att);
+        relCoef = coef (T.rel);
+    }
+    double fs = 48000;
+    Weighting keyW[2];
+    AttackMode curAttack = AttackMode::Slow;
+    double gateCoef = 0, attCoef = 0, relCoef = 0;
+    double msG = 0, msR = 0, grDb = 0, keyDb = -100;
 };
 
 } // namespace rider

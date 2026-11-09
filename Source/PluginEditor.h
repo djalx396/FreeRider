@@ -99,6 +99,9 @@ public:
 private:
     void timerCallback() override;
     void setupKnob (juce::Slider&, juce::Label&, const juce::String&);
+    void fillChannelBox (juce::ComboBox&);
+    void refreshChannelNames();
+    void askRename (int channel);
 
     RiderProcessor& proc;
     RiderLookAndFeel lnf;
@@ -111,6 +114,17 @@ private:
     Led rideLed, musicLed, clipLed;
     float outDisp = 0.f;
     juce::Rectangle<int> outMeterArea, clipArea;
+
+    // Ecosystem panel: ducker + send
+    juce::ComboBox duckBox, sendBox, alignBox;
+    juce::TextButton duckName { "NAME" }, sendName { "NAME" };
+    juce::Slider depth, thresh;
+    juce::Label depthLabel, threshLabel;
+    juce::AudioProcessorValueTreeState::ComboBoxAttachment duckAtt, sendAtt, alignAtt;
+    juce::AudioProcessorValueTreeState::SliderAttachment depthAtt, threshAtt;
+    juce::Label ecoStatus;
+    juce::Rectangle<int> grArea;
+    int shownNamesVersion = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RiderEditor)
 };

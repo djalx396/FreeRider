@@ -343,7 +343,12 @@ RiderEditor::RiderEditor (RiderProcessor& p)
     : AudioProcessorEditor (&p), proc (p), meter (p), fader (p),
       vsensAtt (p.apvts, ID::vsens, vsens), msensAtt (p.apvts, ID::msens, msens), outputAtt (p.apvts, ID::output, output),
       attack (*p.apvts.getParameter (ID::attack), { "SLOW", "FAST" }, ui::ride),
-      mode   (*p.apvts.getParameter (ID::mode),   { "OFF", "WRITE", "READ" }, ui::target)
+      mode   (*p.apvts.getParameter (ID::mode),   { "OFF", "WRITE", "READ" }, ui::target),
+      duckAtt  (p.apvts, ID::duck,  (fillChannelBox (duckBox), duckBox)),
+      sendAtt  (p.apvts, ID::send,  (fillChannelBox (sendBox), sendBox)),
+      alignAtt (p.apvts, ID::align, (alignBox.addItemList ({ "Short", "Normal", "Safe", "Max" }, 1), alignBox)),
+      depthAtt (p.apvts, ID::duckDepth, depth),
+      threshAtt (p.apvts, ID::duckThresh, thresh)
 {
     setLookAndFeel (&lnf);
     addAndMakeVisible (meter);
@@ -360,7 +365,33 @@ RiderEditor::RiderEditor (RiderProcessor& p)
     addAndMakeVisible (attack);
     addAndMakeVisible (mode);
     for (auto* l : { &rideLed, &musicLed, &clipLed }) { l->setInterceptsMouseClicks (false, false); addAndMakeVisible (l); }
-    setSize (780, 470);
+
+    // Ecosystem panel
+    for (auto* b : { &duckBox, &sendBox, &alignBox }) addAndMakeVisible (b);
+    setupKnob (depth, depthLabel, "DEPTH");
+    setupKnob (thresh, threshLabel, "THRESHOLD");
+    depth.textFromValueFunction = [] (double v) { return "-" + String (v, 1) + " dB"; };
+    depth.setDoubleClickReturnValue (true, 6.0);
+    thresh.textFromValueFunction = [] (double v) { return String (v, 1) + " dB"; };
+    thresh.setDoubleClickReturnValue (true, -30.0);
+    depth.updateText(); thresh.updateText();
+    for (auto* b : { &duckName, &sendName })
+    {
+        b->setColour (TextButton::buttonOnColourId, ui::ride);
+        addAndMakeVisible (b);
+    }
+    duckName.setTooltip ("Rename the channel the ducker listens to");
+    sendName.setTooltip ("Rename the channel this instance sends on");
+    duckName.onClick = [this] { askRename (proc.getDuckChannel()); };
+    sendName.onClick = [this] { askRename (proc.getSendChannel()); };
+    ecoStatus.setFont (uiFont (11.f));
+    ecoStatus.setColour (Label::textColourId, ui::text);
+    ecoStatus.setJustificationType (Justification::topLeft);
+    ecoStatus.setMinimumHorizontalScale (1.f);
+    addAndMakeVisible (ecoStatus);
+    refreshChannelNames();
+
+    setSize (780, 630);
     startTimerHz (30);
 }
 
@@ -382,6 +413,45 @@ void RiderEditor::setupKnob (Slider& s, Label& l, const String& name)
     addAndMakeVisible (l);
 }
 
+void RiderEditor::fillChannelBox (ComboBox& b)
+{
+    b.clear (dontSendNotification);
+    for (int c = 0; c <= eco::kNumChannels; ++c) b.addItem (proc.channelLabel (c), c + 1);
+}
+
+void RiderEditor::refreshChannelNames()
+{
+    if (shownNamesVersion == proc.getNamesVersion()) return;
+    shownNamesVersion = proc.getNamesVersion();
+    for (auto* b : { &duckBox, &sendBox })
+        for (int c = 0; c <= eco::kNumChannels; ++c) b->changeItemText (c + 1, proc.channelLabel (c));
+    duckBox.repaint(); sendBox.repaint();
+}
+
+void RiderEditor::askRename (int channel)
+{
+    if (channel <= 0)
+    {
+        AlertWindow::showMessageBoxAsync (MessageBoxIconType::InfoIcon, "Rename channel", "Pick a channel first (Off can't be renamed).");
+        return;
+    }
+    auto* w = new AlertWindow ("Rename channel " + String (channel).paddedLeft ('0', 2),
+                               "Every Ecosystem plug-in in the project shows the new name. Leave it empty to go back to the number.",
+                               MessageBoxIconType::NoIcon);
+    w->addTextEditor ("name", proc.channelLabel (channel).fromFirstOccurrenceOf (" ", false, false));
+    w->addButton ("Rename", 1, KeyPress (KeyPress::returnKey));
+    w->addButton ("Cancel", 0, KeyPress (KeyPress::escapeKey));
+    SafePointer<RiderEditor> safe (this);
+    w->enterModalState (true, ModalCallbackFunction::create ([safe, w, channel] (int r)
+    {
+        if (r == 1 && safe != nullptr)
+        {
+            safe->proc.renameChannel (channel, w->getTextEditorContents ("name"));
+            safe->refreshChannelNames();
+        }
+    }), true);
+}
+
 void RiderEditor::resized()
 {
     meter.setBounds (20, 48, 740, 78);
@@ -400,6 +470,19 @@ void RiderEditor::resized()
     outMeterArea = { 650, 258, 10, 160 };
     clipLed.setBounds (670, 258, 14, 14);
     clipArea = clipLed.getBounds().expanded (6);
+
+    // Ecosystem panel (20, 462, 740, 152)
+    duckBox.setBounds (36, 504, 150, 26);
+    duckName.setBounds (190, 504, 52, 26);
+    depthLabel.setBounds (250, 478, 90, 16);
+    depth.setBounds (255, 494, 80, 104);
+    threshLabel.setBounds (340, 478, 90, 16);
+    thresh.setBounds (345, 494, 80, 104);
+    grArea = { 440, 506, 160, 10 };
+    ecoStatus.setBounds (436, 536, 318, 74);
+    sendBox.setBounds (612, 504, 98, 26);
+    sendName.setBounds (712, 504, 42, 26);
+    alignBox.setBounds (36, 570, 150, 26);
 }
 
 void RiderEditor::mouseDown (const MouseEvent& e)
@@ -409,6 +492,9 @@ void RiderEditor::mouseDown (const MouseEvent& e)
 
 void RiderEditor::timerCallback()
 {
+    refreshChannelNames();
+    ecoStatus.setText (proc.getEcoStatus(), dontSendNotification);
+    repaint (grArea.expanded (4, 14));
     meter.tick();
     fader.repaint();
     rideLed.set (proc.telemetry.riding.load() ? 1.f : 0.f, ui::ride);
@@ -426,7 +512,7 @@ void RiderEditor::paint (Graphics& g)
     g.setFont (uiFont (20.f, true)); g.setColour (ui::text);
     g.drawText ("FREE RIDER", 22, 10, 160, 28, Justification::centredLeft);
     g.setFont (uiFont (11.f)); g.setColour (ui::dim);
-    g.drawText ("automatic vocal gain rider   |   v0.1", 168, 14, 300, 22, Justification::centredLeft);
+    g.drawText ("automatic vocal gain rider   |   v0.2   |   The Ecosystem", 168, 14, 360, 22, Justification::centredLeft);
     g.drawText (proc.getTotalNumInputChannels() > 2 ? "music sidechain: track ch 3/4" : "no sidechain bus",
                 520, 14, 240, 22, Justification::centredRight);
 
@@ -455,6 +541,27 @@ void RiderEditor::paint (Graphics& g)
               : m == rider::AutoMode::Read  ? "fader follows the automation lane"
                                             : "internal engine, no automation",
                 512, 204, 246, 14, Justification::centred);
+
+    // Ecosystem panel
+    g.setColour (ui::panel);
+    g.fillRoundedRectangle (20, 462, 740, 152, 6);
+    g.setFont (uiFont (11.f, true));
+    g.setColour (ui::dim);
+    g.drawText ("ECOSYSTEM", 36, 470, 150, 14, Justification::centredLeft);
+    g.setFont (uiFont (10.f, true));
+    g.drawText ("DUCK FROM", 36, 488, 150, 14, Justification::centredLeft);
+    g.drawText ("ALIGN (while ducking)", 36, 554, 200, 14, Justification::centredLeft);
+    g.drawText ("SEND TO", 612, 488, 140, 14, Justification::centredLeft);
+    g.drawText ("DUCK", 440, 488, 160, 14, Justification::centredLeft);
+    {
+        auto gr = grArea.toFloat();
+        g.setColour (ui::bg); g.fillRoundedRectangle (gr, 2);
+        const float d = proc.telemetry.duckGrDb.load();
+        const float w = jlimit (0.f, 1.f, d / 24.f) * gr.getWidth();
+        g.setColour (ui::target); g.fillRoundedRectangle (gr.withWidth (w), 2);
+        g.setColour (d > 0.05f ? ui::target : ui::dim);
+        g.drawText ("-" + String (d, 1) + " dB", Rectangle<float> (gr.getRight() - 70, gr.getY() - 16, 70, 14), Justification::centredRight);
+    }
 
     // output meter
     auto om = outMeterArea.toFloat();
