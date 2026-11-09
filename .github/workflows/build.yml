@@ -1,0 +1,37 @@
+name: Build Free Rider
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Configure (universal: Apple Silicon + Intel)"
+        run: cmake -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build VST3 + AU
+        run: cmake --build build --config Release --target FreeRider_VST3 FreeRider_AU -- -quiet
+
+      - name: Ad-hoc sign
+        run: |
+          codesign --force --deep -s - "build/FreeRider_artefacts/Release/VST3/Free Rider.vst3"
+          codesign --force --deep -s - "build/FreeRider_artefacts/Release/AU/Free Rider.component"
+
+      - name: Check architectures
+        run: lipo -info "build/FreeRider_artefacts/Release/VST3/Free Rider.vst3/Contents/MacOS/Free Rider"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -R "build/FreeRider_artefacts/Release/VST3/Free Rider.vst3" dist/
+          cp -R "build/FreeRider_artefacts/Release/AU/Free Rider.component" dist/
+          cd dist && zip -qry ../FreeRider-macOS.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeRider-macOS
+          path: FreeRider-macOS.zip
