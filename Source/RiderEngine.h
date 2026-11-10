@@ -1,28 +1,19 @@
-// RiderEngine.h — automatic vocal gain rider (Waves Vocal Rider–style behaviour)
+// RiderEngine.h — Free Rider audio engine (v0.3)
 //
-// No JUCE dependency, so it can be tested offline. Everything is defined in
-// seconds/dB and recomputed from the sample rate, so behaviour is identical
-// at 44.1, 48, 88.2, 96, 176.4 and 192 kHz. Zero latency: no lookahead.
+// No JUCE dependency, so it can be tested offline. Zero latency.
 //
-// Signal flow (per sample):
-//   vocal in ─► weighting (HPF 100 Hz + 1.5 kHz +4 dB shelf) ─► power (L²+R²)/2
-//     ├─► 10 ms mean-square ─► gate level ─► vocal-activity gate → Ride / Idle
-//     │      opens above Target − 24 − Vocal Sensitivity; a word ends when the level
-//     │      drops 20 dB under the word's peak (or under the threshold); hold, then Idle
-//     └─► peak-style follower (fast up / slow down, set by Attack) ─► ride level
-//   music sidechain ─► same weighting ─► slow mean-square ─► Music offset on Target
-//   Ride:  fader target = clamp(TargetEff − ride level, RangeMin, RangeMax)
-//   Word ending / hold: fader frozen (no riding up into breaths)
-//   Idle:  fader glides to the Idle arrow
-//   fader ─► one-pole glide (Attack Fast/Slow) ─► mode switch (Off / Write / Read / manual)
-//
-// All the time constants below are first-guess values. They are what the
-// capture kit is for: renders of the real plugin give its gain curve directly
-// (output ÷ input), and these numbers get fitted to it.
+//   vocal in ─► detector filters (HPF + 1.5 kHz bell, fitted) ─► power, averaged over the channels
+//   music sidechain ─► same filters ─► power
+//   every ~1 ms chunk: RiderModel::step(vocal power, music power) → fader position
+//   (the riding law fitted to Waves Vocal Rider; see RiderModel.h)
+//   gain: across each chunk the fader glides from the value two chunks back to the value one
+//         chunk back, so the result never depends on the host's block size
+//   then the mode switch (Off / Write / Read / manual) and, in the plug-in, the ducker and Output.
 #pragma once
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include "RiderModel.h"
 
 namespace rider {
 
@@ -47,6 +38,14 @@ struct Biquad
         b0 = (1 + c) / 2 / a0; b1 = -(1 + c) / a0; b2 = b0;
         a1 = -2 * c / a0;      a2 = (1 - al) / a0;
     }
+    void setBell (double fs, double f0, double gainDb, double q)
+    {
+        const double A = std::pow (10.0, gainDb / 40.0), w = 2 * kPi * f0 / fs;
+        const double c = std::cos (w), al = std::sin (w) / (2 * q);
+        const double a0 = 1 + al / A;
+        b0 = (1 + al * A) / a0; b1 = -2 * c / a0; b2 = (1 - al * A) / a0;
+        a1 = -2 * c / a0;       a2 = (1 - al / A) / a0;
+    }
     void setHighShelf (double fs, double f0, double gainDb, double q = 0.7071)
     {
         const double A = std::pow (10.0, gainDb / 40.0), w = 2 * kPi * f0 / fs;
@@ -60,6 +59,21 @@ struct Biquad
     }
 };
 
+// Detector filters of the riding model: 2nd-order high-pass + bell at 1.5 kHz (Q 0.7).
+struct DetectorFilter
+{
+    Biquad hp, bell;
+    void prepare (double fs, double hpf, double bellDb)
+    {
+        hp.setHighpass (fs, std::clamp (hpf, 10.0, 0.45 * fs), 0.7071);
+        bell.setBell (fs, std::min (1500.0, 0.4 * fs), bellDb, 0.7);
+        reset();
+    }
+    void reset() { hp.reset(); bell.reset(); }
+    inline double process (double x) noexcept { return bell.process (hp.process (x)); }
+};
+
+// The ducker's key detector (unchanged from v0.2): HPF 100 Hz + 1.5 kHz +4 dB shelf.
 struct Weighting
 {
     Biquad hp, shelf;
@@ -74,11 +88,11 @@ enum class AutoMode   { Off = 0, Write = 1, Read = 2 };
 struct Settings
 {
     double targetDb   = -21.0;  // 0 … -42 dBFS
-    double vocalSens  =   0.0;  // -12 … +12 dB (higher = picks up quieter material as vocal)
-    double musicSens  =   0.0;  // -12 … +12 dB (higher = music lifts the vocal more)
+    double vocalSens  =   0.0;  // -12 … +12 dB
+    double musicSens  =   0.0;  // -12 … +12 dB
     double rangeMin   =  -6.0;  // -12 … +11 dB
     double rangeMax   =   6.0;  // -11 … +12 dB
-    double idleDb     =   0.0;  // -12 … +12 dB (clamped into the range)
+    double idleDb     =   0.0;  // -12 … +12: position inside the range (-12 = Min, 0 = middle, +12 = Max)
     AttackMode attack = AttackMode::Slow;
     AutoMode   mode   = AutoMode::Off;
     double readDb     =   0.0;  // Rider Fader parameter value, used in Read mode
@@ -96,7 +110,7 @@ struct Telemetry
     std::atomic<float> autoDb    { 0.f };     // what the internal engine wants
     std::atomic<float> musicDb   { -100.f };  // sidechain level
     std::atomic<float> musicLed  { 0.f };     // 0…1 brightness
-    std::atomic<float> targetEff { -21.f };   // Target after music offset
+    std::atomic<float> targetEff { -21.f };   // Target after music lift
     std::atomic<bool>  riding    { false };
     std::atomic<float> duckGrDb  { 0.f };     // ducker gain reduction (positive dB)
     std::atomic<float> keyDb     { -100.f };  // duck key level
@@ -105,33 +119,20 @@ struct Telemetry
 class Engine
 {
 public:
-    // ---- tuning (first guesses; to be fitted against captures) ---------------
-    //            follower att/rel, fader glide, hold, idle glide, onset (down-only) window
-    struct Times { double att, rel, ride, hold, idle, onset; };
-    static constexpr Times kSlow { 0.030, 0.300, 0.150, 0.250, 0.600, 0.060 };
-    static constexpr Times kFast { 0.008, 0.150, 0.050, 0.120, 0.300, 0.020 };
-    static constexpr double kGateTau        = 0.010;
-    static constexpr double kCalDb          = 3.0103; // sine reads its peak level
-    static constexpr double kAbsBelowTarget = 24.0;   // gate threshold at sens 0, relative to Target
-    static constexpr double kHysteresis     = 3.0;
-    static constexpr double kEndDrop        = 20.0;   // word ends this far under its peak
-    static constexpr double kWordPkDecayDbPerS = 6.0;
-    static constexpr double kMusicTau       = 0.300, kMusicSmoothTau = 1.0;
-    static constexpr double kMusicRefBelowTarget = 6.0, kMusicSlope = 0.5, kMusicMaxLift = 12.0;
-    static constexpr double kReadTau        = 0.005;  // de-zipper for automation / manual moves
+    static constexpr double kCalDb = 3.0103;   // meters: a sine reads its peak level
+    static constexpr double kReadTau = 0.005;  // de-zipper for automation / manual moves
+
+    explicit Engine (const double* params = kFitted) { model.setParams (params); std::copy (params, params + P_COUNT, prm); }
 
     void prepare (double sampleRate)
     {
         fs = sampleRate;
-        for (auto& w : vocW) w.prepare (fs);
-        for (auto& w : musW) w.prepare (fs);
-        musicCoef  = coef (kMusicTau);
-        musicSCoef = coef (kMusicSmoothTau);
-        readCoef   = coef (kReadTau);
-        gateCoef   = coef (kGateTau);
-        wordPkDecayPerSample = kWordPkDecayDbPerS / fs;
-        rangeDecayPerSample = 3.0 / fs;  // display range relaxes 3 dB/s
-        setAttack (AttackMode::Slow);
+        chunk = std::max (1, (int) std::lround (fs / 1000.0));
+        model.prepare ((double) chunk / fs);
+        for (auto& w : vocW) w.prepare (fs, prm[P_HPF], prm[P_BELL]);
+        for (auto& w : musW) w.prepare (fs, prm[P_HPF], prm[P_BELL]);
+        readCoef = 1.0 - std::exp (-1.0 / (kReadTau * fs));
+        rangeDecayPerChunk = 3.0 * chunk / fs;   // range display relaxes 3 dB/s
         reset();
     }
 
@@ -139,103 +140,59 @@ public:
     {
         for (auto& w : vocW) w.reset();
         for (auto& w : musW) w.reset();
-        msG = 0; msR = 0; mms = 0; musicDb = -100; level = -100; gateLevel = -100; wordPk = -100;
-        active = false; holding = false; holdLeft = 0; onsetLeft = 0;
-        autoDb = 0; appliedDb = 0; rangeLo = rangeHi = -100;
+        model.reset();
+        accV = accM = 0; count = 0;
+        rampFrom = rampTo = 0; started = false;
+        appliedDb = 0; autoDb = 0; rangeLo = rangeHi = -100; musicDb = -100;
     }
 
-    // Process a block in place. vocal: numCh channels; sc may be null.
-    // Returns nothing; gain is applied to `io`, output trim is NOT applied here.
+    // Process a block in place. sc may be null (no music sidechain).
     void process (float* const* io, int numCh, const float* const* sc, int scCh, int n, const Settings& s, Telemetry* t)
     {
-        if (s.attack != curAttack) setAttack (s.attack);
+        ModelSettings ms;
+        ms.target = s.targetDb; ms.vsens = s.vocalSens; ms.msens = s.musicSens;
+        ms.rmin = s.rangeMin; ms.rmax = s.rangeMax; ms.idle = s.idleDb;
+        ms.fast = s.attack == AttackMode::Fast;
 
-        const double rMin = std::min (s.rangeMin, s.rangeMax - 1.0);
-        const double rMax = std::max (s.rangeMax, rMin + 1.0);
-        const double idle = std::clamp (s.idleDb, rMin, rMax);
-        const double absThr = s.targetDb - kAbsBelowTarget - s.vocalSens;
         const int nv = std::clamp (numCh, 0, kMaxCh);
-        const int ns = std::clamp (scCh, 0, kMaxCh);
-        const double invCh = 1.0 / std::max (1, nv);
-        const double invSc = 1.0 / std::max (1, ns);
-        double lift = 0;
+        const int ns = (sc != nullptr) ? std::clamp (scCh, 0, kMaxCh) : 0;
+        const double invV = 1.0 / std::max (1, nv), invM = 1.0 / std::max (1, ns);
 
         for (int i = 0; i < n; ++i)
         {
-            // --- vocal level --------------------------------------------------
-            // Power average of the weighted channels: (L²+R²)/2, so a wide or
-            // out-of-phase stereo vocal is measured correctly.
             double p = 0;
             for (int c = 0; c < nv; ++c) { const double w = vocW[c].process (io[c][i]); p += w * w; }
-            p *= invCh;
-            msG += gateCoef * (p - msG);
-            msR += (msG > msR ? attCoef : relCoef) * (msG - msR);
-            gateLevel = 10.0 * std::log10 (msG + 1e-20) + kCalDb;
-            level     = 10.0 * std::log10 (msR + 1e-20) + kCalDb;
-
-            // --- music sidechain ------------------------------------------------
-            if (sc != nullptr && scCh > 0)
+            accV += p * invV;
+            if (ns > 0)
             {
-                double pm = 0;
-                for (int c = 0; c < ns; ++c) { const double w = musW[c].process (sc[c][i]); pm += w * w; }
-                pm *= invSc;
-                mms += musicCoef * (pm - mms);
-                const double md = 10.0 * std::log10 (mms + 1e-20) + kCalDb;
-                musicDb += musicSCoef * (md - musicDb);
+                double q = 0;
+                for (int c = 0; c < ns; ++c) { const double w = musW[c].process (sc[c][i]); q += w * w; }
+                accM += q * invM;
             }
-            else
-                musicDb += musicSCoef * (-100.0 - musicDb);
 
-            lift = 0;
-            if (musicDb > -70.0)
-                lift = std::clamp (kMusicSlope * (musicDb + s.musicSens - (s.targetDb - kMusicRefBelowTarget)), 0.0, kMusicMaxLift);
-            const double targetEff = s.targetDb + lift;
+            // fader for this sample: glide from rampFrom to rampTo across the chunk
+            autoDb = rampFrom + (rampTo - rampFrom) * (double) (count + 1) / (double) chunk;
 
-            // --- vocal activity gate --------------------------------------------
-            if (! active)
+            if (++count == chunk)
             {
-                if (gateLevel > absThr)
+                const double f = model.step (accV / chunk, accM / chunk, ms);
+                if (! started) { rampTo = f; started = true; }
+                rampFrom = rampTo; rampTo = f;
+                musicDb = 10.0 * std::log10 (accM / chunk + 1e-20) + kCalDb;
+                const double lv = model.getLevelDb() + kCalDb;
+                if (model.isRiding())
                 {
-                    active = true; holding = false; onsetLeft = onsetSamples; wordPk = gateLevel;
+                    if (lv > rangeHi) rangeHi = lv; else rangeHi -= rangeDecayPerChunk;
+                    if (lv < rangeLo || rangeLo < -99) rangeLo = lv; else rangeLo += rangeDecayPerChunk;
+                    if (rangeLo > rangeHi) rangeLo = rangeHi;
                 }
-            }
-            else
-            {
-                wordPk = std::max (gateLevel, wordPk - wordPkDecayPerSample);
-                const double endThr = std::max (absThr - kHysteresis, wordPk - kEndDrop);
-                if (gateLevel > endThr) { holding = false; holdLeft = holdSamples; }
-                else
-                {
-                    holding = true;
-                    if (--holdLeft <= 0) { active = false; holding = false; }
-                }
+                accV = accM = 0; count = 0;
             }
 
-            // --- internal ride ----------------------------------------------------
-            if (active && ! holding)
-            {
-                const double want = std::clamp (targetEff - level, rMin, rMax);
-                // First moments of a word: the detector is still rising, so only let
-                // the fader come down (catch loud starts), never jump up.
-                if (onsetLeft > 0) { --onsetLeft; if (want < autoDb) autoDb += rideCoef * (want - autoDb); }
-                else autoDb += rideCoef * (want - autoDb);
-
-                if (level > rangeHi) rangeHi = level; else rangeHi -= rangeDecayPerSample;
-                if (level < rangeLo || rangeLo < -99) rangeLo = level; else rangeLo += rangeDecayPerSample;
-                if (rangeLo > rangeHi) rangeLo = rangeHi;
-            }
-            else if (! active)
-                autoDb += idleCoef * (idle - autoDb);
-            // holding: fader stays where it is
-
-            autoDb = std::clamp (autoDb, rMin, rMax);
-
-            // --- what actually gets applied --------------------------------------
             double dest;
             if (s.manual)                       dest = s.manualDb;
             else if (s.mode == AutoMode::Read)  dest = s.readDb;
             else                                dest = autoDb;   // Off and Write
-
             if (s.manual || s.mode == AutoMode::Read) appliedDb += readCoef * (dest - appliedDb);
             else                                      appliedDb = dest;
 
@@ -245,58 +202,40 @@ public:
 
         if (t != nullptr)
         {
-            t->levelDb.store ((float) level);
+            const double lift = model.getLiftDb();
+            t->levelDb.store ((float) (model.getLevelDb() + kCalDb));
             t->rangeLoDb.store ((float) rangeLo);
             t->rangeHiDb.store ((float) rangeHi);
             t->riderDb.store ((float) appliedDb);
-            t->autoDb.store ((float) autoDb);
+            t->autoDb.store ((float) model.getFader());
             t->musicDb.store ((float) musicDb);
-            t->musicLed.store ((float) std::clamp (lift / 6.0, 0.0, 1.0));
+            t->musicLed.store ((float) std::clamp (lift / 4.0, 0.0, 1.0));
             t->targetEff.store ((float) (s.targetDb + lift));
-            t->riding.store (active);
+            t->riding.store (model.isActive());
         }
     }
 
     double getAutoDb() const noexcept { return autoDb; }
     double getAppliedDb() const noexcept { return appliedDb; }
-    bool   isRiding() const noexcept { return active; }
-    double getLevelDb() const noexcept { return level; }
+    bool   isRiding() const noexcept { return model.isActive(); }
+    double getLevelDb() const noexcept { return model.getLevelDb() + kCalDb; }
 
 private:
-    double coef (double tau) const { return 1.0 - std::exp (-1.0 / (tau * fs)); }
-
-    void setAttack (AttackMode a)
-    {
-        curAttack = a;
-        const Times& T = (a == AttackMode::Fast) ? kFast : kSlow;
-        attCoef  = coef (T.att);
-        relCoef  = coef (T.rel);
-        rideCoef = coef (T.ride);
-        idleCoef = coef (T.idle);
-        holdSamples  = (int) std::lround (T.hold * fs);
-        onsetSamples = (int) std::lround (T.onset * fs);
-    }
-
-    double fs = 48000;
     static constexpr int kMaxCh = 2;
-    Weighting vocW[kMaxCh], musW[kMaxCh];
-    AttackMode curAttack = AttackMode::Slow;
-    double attCoef = 0, relCoef = 0, rideCoef = 0, idleCoef = 0, gateCoef = 0;
-    double musicCoef = 0, musicSCoef = 0, readCoef = 0;
-    double wordPkDecayPerSample = 0, rangeDecayPerSample = 0;
-    int holdSamples = 0, onsetSamples = 0;
-
-    double msG = 0, msR = 0, mms = 0, level = -100, gateLevel = -100, wordPk = -100, musicDb = -100;
-    bool active = false, holding = false; int holdLeft = 0, onsetLeft = 0;
-    double autoDb = 0, appliedDb = 0, rangeLo = -100, rangeHi = -100;
+    double prm[P_COUNT] {};
+    RiderModel model;
+    DetectorFilter vocW[kMaxCh], musW[kMaxCh];
+    double fs = 48000, readCoef = 0, rangeDecayPerChunk = 0;
+    int chunk = 48, count = 0;
+    double accV = 0, accM = 0, rampFrom = 0, rampTo = 0, autoDb = 0, appliedDb = 0;
+    double rangeLo = -100, rangeHi = -100, musicDb = -100;
+    bool started = false;
 };
 
 //==============================================================================
-// Ducker: sits right after the rider. Listens to a key (an Ecosystem channel) and
-// pulls the vocal down while the key is above the threshold, by up to Depth dB.
-// Its key detector is the rider's own (same weighting, same 10 ms gate RMS, same
-// peak-style follower), and it follows the rider's Attack switch, so Fast/Slow
-// set the duck speed exactly as they set the riding speed:
+// Ducker: sits right after the rider (unchanged from v0.2). Listens to a key (an Ecosystem
+// channel) and pulls the vocal down while the key is above the threshold, by up to Depth dB.
+// It follows the rider's Attack switch:
 //   Slow: 30 ms down / 300 ms back up      Fast: 8 ms down / 150 ms back up
 //   reduction = clamp(keyLevel − Threshold, 0, Depth)   (1 dB of duck per dB over)
 struct DuckSettings
@@ -314,7 +253,7 @@ public:
     {
         fs = sampleRate;
         for (auto& w : keyW) w.prepare (fs);
-        gateCoef = coef (Engine::kGateTau);
+        gateCoef = coef (0.010);
         setAttack (AttackMode::Slow);
         reset();
     }
@@ -360,9 +299,8 @@ private:
     void setAttack (AttackMode a)
     {
         curAttack = a;
-        const auto& T = (a == AttackMode::Fast) ? Engine::kFast : Engine::kSlow;
-        attCoef = coef (T.att);
-        relCoef = coef (T.rel);
+        attCoef = coef (a == AttackMode::Fast ? 0.008 : 0.030);
+        relCoef = coef (a == AttackMode::Fast ? 0.150 : 0.300);
     }
     double fs = 48000;
     Weighting keyW[2];

@@ -240,7 +240,9 @@ void RiderFader::paint (Graphics& g)
 
     // idle arrow (right)
     {
-        const float y = dbToY (jlimit (lo, hi, idleDb)), xl = t.getRight() + 4;
+        // Idle is a position inside the range (-12 = Range Min, 0 = middle, +12 = Range Max)
+        const float idlePos = lo + (jlimit (-12.f, 12.f, idleDb) + 12.f) / 24.f * (hi - lo);
+        const float y = dbToY (idlePos), xl = t.getRight() + 4;
         Path p; p.addTriangle (xl, y, xl + 12, y - 7, xl + 12, y + 7);
         g.setColour (ui::text.withAlpha (0.8f)); g.fillPath (p);
         g.setFont (uiFont (9.5f));
@@ -292,7 +294,14 @@ void RiderFader::mouseDrag (const MouseEvent& e)
     {
         case Grab::min:  minAtt.setValueAsPartOfGesture (jlimit (-12.f, jmin (11.f, maxDb - 1.f), d)); break;
         case Grab::max:  maxAtt.setValueAsPartOfGesture (jlimit (jmax (-11.f, minDb + 1.f), 12.f, d)); break;
-        case Grab::idle: idleAtt.setValueAsPartOfGesture (d); break;
+        case Grab::idle:
+        {
+            // dragged position -> Idle value (position inside the range)
+            const float lo = jmin (minDb, maxDb - 1.f), hi = jmax (maxDb, lo + 1.f);
+            const float v = (jlimit (lo, hi, d) - lo) / (hi - lo) * 24.f - 12.f;
+            idleAtt.setValueAsPartOfGesture (std::round (v * 10.f) / 10.f);
+            break;
+        }
         case Grab::cap:
             proc.manualDb.store (d);
             if (proc.getMode() == rider::AutoMode::Read) riderAtt.setValueAsPartOfGesture (d);
@@ -480,8 +489,8 @@ void RiderEditor::resized()
     thresh.setBounds (345, 494, 80, 104);
     grArea = { 440, 506, 160, 10 };
     ecoStatus.setBounds (436, 536, 318, 74);
-    sendBox.setBounds (612, 504, 98, 26);
-    sendName.setBounds (712, 504, 42, 26);
+    sendBox.setBounds (604, 504, 96, 26);
+    sendName.setBounds (702, 504, 54, 26);
     alignBox.setBounds (36, 570, 150, 26);
 }
 
@@ -512,7 +521,7 @@ void RiderEditor::paint (Graphics& g)
     g.setFont (uiFont (20.f, true)); g.setColour (ui::text);
     g.drawText ("FREE RIDER", 22, 10, 160, 28, Justification::centredLeft);
     g.setFont (uiFont (11.f)); g.setColour (ui::dim);
-    g.drawText ("automatic vocal gain rider   |   v0.2   |   The Ecosystem", 168, 14, 360, 22, Justification::centredLeft);
+    g.drawText ("automatic vocal gain rider   |   v0.3   |   The Ecosystem", 168, 14, 360, 22, Justification::centredLeft);
     g.drawText (proc.getTotalNumInputChannels() > 2 ? "music sidechain: track ch 3/4" : "no sidechain bus",
                 520, 14, 240, 22, Justification::centredRight);
 
